@@ -1,119 +1,123 @@
+use std::marker::PhantomData;
+
 use franklin_crypto::bellman::SynthesisError;
 use franklin_crypto::bellman::pairing::*;
-use franklin_crypto::bellman::pairing::ff::*;
 use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
 use franklin_crypto::plonk::circuit::allocated_num::Num;
-use franklin_crypto::plonk::circuit::boolean::Boolean;
-use franklin_crypto::plonk::circuit::byte::Byte;
 
-use franklin_crypto::plonk::circuit::hashes_with_tables::sha256::gadgets::Sha256Gadget;
-use franklin_crypto::plonk::circuit::sha256::sha256 as sha256_no_tables;
+use super::utils::digest::{RawDigest, Digest};
 
-use sha2::{Sha256, Digest as Sha256Digest};
-
-use super::{Digest, RawDigest, NumExtension};
-
-pub const MERKLE_DIGEST_NUM_BYTES: usize = 32;
-pub const MERKLE_DIGEST_NUM_WORDS: usize = 4;
-
-#[derive(Debug)]
-pub struct MerkleGadget<E: Engine> {
-    table_gadget: Option<Sha256Gadget<E>>,
+pub trait MerkleCompressor<E: Engine, const N: usize, const M: usize> {
+    type Params: Clone;
+    fn compress<CS: ConstraintSystem<E>>(&self, cs: &mut CS, x: Digest<E, N, M>, y: Digest<E, N, M>) -> Result<Digest<E, N, M>, SynthesisError>;
+    fn compress_raw(x: RawDigest<E, N, M>, y: RawDigest<E, N, M>, params: Self::Params) -> RawDigest<E, N, M>;
 }
 
-fn bytes_to_bools<E: Engine, CS: ConstraintSystem<E>>(cs: &mut CS, bytes: &[Byte<E>]) -> Vec<Boolean> {
-    bytes.iter().flat_map(|byte| {
-        let mut bits = byte.into_num().into_bits_le(cs, Some(8)).unwrap();
-        bits.reverse();
-        bits
-    }).collect()
+pub struct MerkleGadget<'a, E: Engine, const N: usize, const M: usize, C: MerkleCompressor<E, N, M>> {
+    compressor: &'a C,
+    phantom: PhantomData<E>
 }
 
-fn bools_to_bytes<E: Engine, CS: ConstraintSystem<E>>(cs: &mut CS, bools: &[Boolean]) -> Result<Vec<Byte<E>>, SynthesisError> {
-    let two = E::Fr::from_str("2").unwrap();
-    let nums: Vec<_> = bools.iter().map(|b| Ok::<_, SynthesisError>(Num::alloc(cs, b.get_value_in_field::<E>())?)).collect::<Result<_,_>>()?;
-    nums.chunks(8).map(
-        |chunk| {
-            let num = Num::weighted_sum(cs, chunk, &two)?;
-            Byte::from_num(cs, num)
-        }
-    ).collect()
-}
-
-pub type RawMerkleDigest<E> = RawDigest<E, MERKLE_DIGEST_NUM_WORDS>;
-pub type MerkleDigest<E> = Digest<E, MERKLE_DIGEST_NUM_WORDS>;
-
-impl<E: Engine> MerkleGadget<E> {
-    pub fn new<CS: ConstraintSystem<E>>(cs: &mut CS, use_tables: bool) -> Result<Self, SynthesisError> {
-        let table_gadget = if use_tables { Some(Sha256Gadget::new(cs, None, None, false, false, 0, "")?) } else { None };
-        Ok(Self { table_gadget })
+impl<'a, E: Engine, const N: usize, const M: usize, C: MerkleCompressor<E, N, M> + 'a> MerkleGadget<'a, E, N, M, C> {
+    pub fn new(compressor: &'a C) -> Self {
+        Self { compressor, phantom: PhantomData }
     }
 
-    fn hash<CS: ConstraintSystem<E>>(&self, cs: &mut CS, input: &[Byte<E>]) -> Result<[Byte<E>; MERKLE_DIGEST_NUM_BYTES], SynthesisError> {
-        let out = match &self.table_gadget {
-            Some(gadget) => gadget.sha256_from_bytes_to_bytes(cs, &input)?.to_vec(),
-            None => {
-                let inp_bools = bytes_to_bools(cs, input);
-                let out_bools = sha256_no_tables(cs, &inp_bools)?;
-                bools_to_bytes(cs, &out_bools)?
-            }
-        };
-        Ok(out.as_slice().try_into().expect("unexpected digest size"))
-    }
-
-    pub fn merkle_root<CS: ConstraintSystem<E>>(&self, cs: &mut CS, inputs: Vec<Vec<Byte<E>>>) -> Result<MerkleDigest<E>, SynthesisError> {
+    fn merklize<CS: ConstraintSystem<E>>(
+        &self,
+        cs: &mut CS,
+        inputs: Vec<Digest<E, N, M>>
+    ) -> Result<(Digest<E, N, M>, Vec<Vec<Digest<E, N, M>>>), SynthesisError>
+    {
+        let mut intermediate = Vec::new();
         let mut values = inputs;
         assert!(values.len() > 0);
         while values.len() != 1 {
             assert!(values.len() % 2 == 0);
-            values = values.chunks(2).map(
+            let layer = values;
+            values = layer.chunks(2).map(
                 |chunk| {
-                    let inp = [chunk[0].as_slice(), chunk[1].as_slice()].concat();
-                    self.hash(cs, &inp).map(|h| h.to_vec())
+                    self.compressor.compress(cs, chunk[0].clone(), chunk[1].clone())
                 }
             ).collect::<Result<Vec<_>, _>>()?;
+            intermediate.push(layer);
         }
-        MerkleDigest::from_le_bytes(cs, &values[0])
+        let root = values.pop().unwrap();
+        Ok((root, intermediate))
+    }
+
+    fn raw_merklize(inputs: Vec<RawDigest<E, N, M>>, params: C::Params) -> (RawDigest<E, N, M>, Vec<Vec<RawDigest<E, N, M>>>) {
+        let mut intermediate = Vec::new();
+        let mut values = inputs;
+        assert!(values.len() > 0);
+        while values.len() != 1 {
+            assert!(values.len() % 2 == 0);
+            let layer = values;
+            values = layer.chunks(2).map(
+                |chunk| { 
+                    C::compress_raw(chunk[0], chunk[1], params.clone())
+                }
+            ).collect();
+            intermediate.push(layer);
+        }
+        let root = values.pop().unwrap();
+        (root, intermediate)
+    }
+
+    pub fn merkle_root<CS: ConstraintSystem<E>>(&self, cs: &mut CS, inputs: Vec<Digest<E, N, M>>) -> Result<Digest<E, N, M>, SynthesisError>
+    {
+        let (root, _) = self.merklize(cs, inputs)?;
+        Ok(root)
+    }
+
+    pub fn raw_merkle_root(inputs: Vec<RawDigest<E, N, M>>, params: C::Params) -> RawDigest<E, N, M> {
+        let (root, _) = Self::raw_merklize(inputs, params);
+        root
+    }
+
+    pub fn raw_compute_proof(
+        index: usize,
+        inputs: Vec<RawDigest<E, N, M>>,
+        params: C::Params
+    ) -> Vec<RawDigest<E, N, M>> {
+        assert!(index < inputs.len());
+        let mut result = Vec::new();
+        let (_, intermediate) = Self::raw_merklize(inputs, params);
+        let mut idx = index;
+        for layer in intermediate {
+            let proof_node = layer[idx ^ 1];
+            idx >>= 1;
+            result.push(proof_node);
+        }
+        result
+    }
+
+    pub fn recompute_root<CS: ConstraintSystem<E>>(
+        &self,
+        cs: &mut CS,
+        index: Num<E>,
+        value: Digest<E, N, M>,
+        proof: &[Digest<E, N, M>],
+    ) -> Result<Digest<E, N, M>, SynthesisError> {
+        let mut current = value;
+        let bits = index.into_bits_le(cs, Some(proof.len()))?;
+        for (bit, witness) in bits.iter().zip(proof.iter()) {
+            let left = Digest::conditionally_select(cs, bit, witness, &current)?;
+            let right = Digest::conditionally_select(cs, bit, &current, witness)?;
+            current = self.compressor.compress(cs, left, right)?;
+        }
+        Ok(current)
     }
 
     pub fn verify<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
-        root: MerkleDigest<E>,
         index: Num<E>,
-        value: &[Byte<E>],
-        proof: &[Vec<Byte<E>>],
+        value: Digest<E, N, M>,
+        proof: &[Digest<E, N, M>],
+        root: Digest<E, N, M>,
     ) -> Result<(), SynthesisError> {
-        let mut current = value;
-        let bits = index.into_bits_le(cs, Some(proof.len()))?;
-        let mut buf;
-        for (bit, witness) in bits.iter().zip(proof.iter()) {
-            let len = current.len() + witness.len();
-            let input_if_0 = [current, witness].concat();
-            let input_if_1 = [witness, current].concat();
-            let input = (0..len).map(
-                |i| Byte::conditionally_select(cs, &bit, &input_if_1[i], &input_if_0[i])
-            ).collect::<Result<Vec<_>, _>>()?;
-            buf = self.hash(cs, &input)?;
-            current = &buf;
-        }
-        let computed_root = MerkleDigest::from_le_bytes(cs, &current)?;
-        computed_root.enforce_equal(cs, &root)
-    }
-
-    pub fn raw_merkle_root(inputs: Vec<Vec<u8>>) -> RawMerkleDigest<E> {
-        let mut values = inputs;
-        while values.len() != 1 {
-            assert!(values.len() % 2 == 0);
-            values = values.chunks(2).map(
-                |chunk| { 
-                    let mut hasher = Sha256::new();
-                    hasher.update(&chunk[0]);
-                    hasher.update(&chunk[1]);
-                    hasher.finalize().to_vec()
-                }
-            ).collect();
-        }
-        RawMerkleDigest::from_bytes32(values[0].clone().try_into().expect("unexpected digest size"))
+        let computed = self.recompute_root(cs, index, value, proof)?;
+        computed.enforce_equal(cs, &root)
     }
 }

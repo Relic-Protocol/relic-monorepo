@@ -715,7 +715,7 @@ impl<E: Engine> Num<E> {
         cs: &mut CS, a: &Self, b: &Self, c: &Self, ab_coeff: E::Fr, c_coeff: E::Fr
     ) -> Result<Self, SynthesisError>
     {
-        let result_val = {
+        let result_fn = || {
             let a_val = a.get_value().grab()?;
             let b_val = b.get_value().grab()?;
             let c_val = c.get_value().grab()?;
@@ -734,10 +734,10 @@ impl<E: Engine> Num<E> {
         // if all of the variables are constant:
         // return constant
         if [a, b, c].iter().all(|x| x.is_constant()) {
-            return Ok(Num::Constant(result_val.unwrap()))
+            return Ok(Num::Constant(result_fn().unwrap()))
         }
         
-        let result = AllocatedNum::alloc(cs, || result_val)?;
+        let result = AllocatedNum::alloc(cs, result_fn)?;
         let mut gate = MainGateTerm::new();
         let mut cnst = E::Fr::zero();
 

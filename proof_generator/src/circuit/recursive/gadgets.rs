@@ -1,7 +1,7 @@
 use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
 use franklin_crypto::plonk::circuit::allocated_num::*;
-use super::affine_point_wrapper::aux_data::*;
-use super::affine_point_wrapper::*;
+use franklin_crypto::plonk::circuit::affine_point_wrapper::aux_data::*;
+use franklin_crypto::plonk::circuit::affine_point_wrapper::*;
 
 use franklin_crypto::bellman::SynthesisError;
 

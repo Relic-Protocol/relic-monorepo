@@ -1,16 +1,19 @@
-mod affine_point_wrapper;
-mod channel;
 mod gadgets;
 mod helper_functions;
 mod utils;
 
-use self::affine_point_wrapper::without_flag_unchecked::*;
-use self::affine_point_wrapper::aux_data::*;
-use self::affine_point_wrapper::*;
-use self::channel::*;
+use crate::circuit::gadgets::sha256::Sha256MerkleGadget;
+use crate::circuit::gadgets::variable_jive::JiveMerkleGadget;
+
+use franklin_crypto::jive::StatefulJive;
+use franklin_crypto::plonk::circuit::affine_point_wrapper::*;
+use franklin_crypto::plonk::circuit::affine_point_wrapper::without_flag_unchecked::*;
+use franklin_crypto::plonk::circuit::affine_point_wrapper::aux_data::*;
 use self::gadgets::*;
 use self::helper_functions::*;
 use self::utils::*;
+use super::gadgets::variable_jive::JiveGadget;
+use super::gadgets::variable_jive::{RawJiveDigest, JiveDigest};
 use super::param::*;
 
 use franklin_crypto::bellman::pairing::*;
@@ -18,8 +21,8 @@ use franklin_crypto::bellman::plonk::better_better_cs::cs::*;
 use franklin_crypto::plonk::circuit::allocated_num::*;
 use franklin_crypto::plonk::circuit::linear_combination::*;
 use franklin_crypto::plonk::circuit::sha256::sha256 as sha256_circuit_hash;
-use franklin_crypto::plonk::circuit::rescue::*;
-use franklin_crypto::rescue::{RescueEngine, RescueHashParams, StatefulRescue};
+use franklin_crypto::jive::JiveEngine;
+use franklin_crypto::plonk::circuit::channel::{ChannelGadget, JiveChannelGadget};
 
 use franklin_crypto::bellman::SynthesisError;
 
@@ -57,14 +60,16 @@ use franklin_crypto::bellman::plonk::domains::*;
 
 use franklin_crypto::plonk::circuit::simple_term::*;
 
-use super::gadgets::merkle::{MerkleGadget,MerkleDigest,RawMerkleDigest};
+use super::gadgets::merkle::{MerkleGadget};
+use super::gadgets::sha256::{Sha256Hasher,Sha256Digest,RawSha256Digest};
 use super::gadgets::variable_keccak::{KeccakDigest,RawKeccakDigest};
 
 #[derive(Clone)]
 pub struct RawProofInputs<E: Engine> {
     pub parent_digest: RawKeccakDigest<E>,
     pub last_digest: RawKeccakDigest<E>,
-    pub merkle_root: RawMerkleDigest<E>,
+    pub merkle_root: RawSha256Digest<E>,
+    pub auxiliary_root: RawJiveDigest<E>,
     pub for_gen: Option<Vec<E::Fr>>,
     pub for_x: Option<Vec<E::Fr>>,
 }
@@ -73,38 +78,41 @@ impl<E:Engine> RawProofInputs<E> {
     fn parse(inputs: &[E::Fr]) -> Self {
         let (parent_digest, remaining) = RawKeccakDigest::<E>::parse_digest(inputs);
         let (last_digest, remaining) = RawKeccakDigest::<E>::parse_digest(remaining);
-        let (merkle_root, remaining) = RawMerkleDigest::<E>::parse_digest(remaining);
+        let (merkle_root, remaining) = RawSha256Digest::<E>::parse_digest(remaining);
+        let (auxiliary_root, remaining) = RawJiveDigest::<E>::parse_digest(remaining);
         let (for_gen, remaining) = (remaining.get(0..8).map(|s| s.to_vec()), remaining.get(8..).unwrap_or(remaining));
         let for_x = remaining.get(0..8).map(|s| s.to_vec());
-        Self { parent_digest, last_digest, merkle_root, for_gen, for_x }
+        Self { parent_digest, last_digest, merkle_root, auxiliary_root, for_gen, for_x }
     }
 }
 
 pub struct ProofInputs<E: Engine> {
     pub parent_digest: KeccakDigest<E>,
     pub last_digest: KeccakDigest<E>,
-    pub merkle_root: MerkleDigest<E>,
+    pub merkle_root: Sha256Digest<E>,
+    pub auxiliary_root: JiveDigest<E>,
     pub for_gen: Option<Vec<AllocatedNum<E>>>,
     pub for_x: Option<Vec<AllocatedNum<E>>>,
 }
 
 impl<E:Engine> ProofInputs<E> {
-    pub const NUM_VARIABLES_INNER: usize = 2 * KeccakDigest::<E>::NUM_VARIABLES + MerkleDigest::<E>::NUM_VARIABLES;
+    pub const NUM_VARIABLES_INNER: usize = 2 * KeccakDigest::<E>::NUM_VARIABLES + Sha256Digest::<E>::NUM_VARIABLES + JiveDigest::<E>::NUM_VARIABLES;
     pub const NUM_VARIABLES_RECURSIVE: usize = Self::NUM_VARIABLES_INNER + 16;
     fn parse(inputs: &[AllocatedNum<E>]) -> Self {
         let (parent_digest, remaining) = KeccakDigest::<E>::parse_digest(inputs);
         let (last_digest, remaining) = KeccakDigest::<E>::parse_digest(remaining);
-        let (merkle_root, remaining) = MerkleDigest::<E>::parse_digest(remaining);
+        let (merkle_root, remaining) = Sha256Digest::<E>::parse_digest(remaining);
+        let (auxiliary_root, remaining) = JiveDigest::<E>::parse_digest(remaining);
         let (for_gen, remaining) = (remaining.get(0..8).map(|s| s.to_vec()), remaining.get(8..).unwrap_or(remaining));
         let for_x = remaining.get(0..8).map(|s| s.to_vec());
-        Self { parent_digest, last_digest, merkle_root, for_gen, for_x }
+        Self { parent_digest, last_digest, merkle_root, auxiliary_root, for_gen, for_x }
     }
 }
 
 #[derive(Clone)]
 pub struct RecursiveAggregationCircuit<
     'a,
-    E: RescueEngine,
+    E: JiveEngine,
     C: Circuit<E>,
     OldP: PlonkConstraintSystemParams<E>,
     WP: WrappedAffinePoint<'a, E>,
@@ -115,13 +123,12 @@ pub struct RecursiveAggregationCircuit<
     pub num_inputs: usize,
     pub inner_vk: &'a VerificationKey<E, C>,
     pub proofs: Option<&'a Vec<Proof<E, C>>>,
-    pub rescue_params: &'a E::Params,
+    pub jive_params: &'a <E as JiveEngine>::Params,
     pub rns_params: &'a RnsParameters<E, <E::G1Affine as GenericCurveAffine>::Base>,
     pub aux_data: AD,
     pub transcript_params: &'a T::Params,
 
     pub inputs: Option<Vec<RawProofInputs<E>>>,
-    pub merkle_root: Option<RawMerkleDigest<E>>,
 
     pub is_inner_recursive: bool,
     pub is_outer_recursive: bool,
@@ -133,17 +140,13 @@ pub struct RecursiveAggregationCircuit<
 }
 impl<
         'a,
-        E: RescueEngine,
+        E: JiveEngine,
         C: Circuit<E>,
         OldP: PlonkConstraintSystemParams<E>,
         WP: WrappedAffinePoint<'a, E>,
         AD: AuxData<E>,
         T: ChannelGadget<E>,
-    > Circuit<E> for RecursiveAggregationCircuit<'a, E, C, OldP, WP, AD, T>
-where
-    <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox0: PlonkCsSBox<E>,
-    <<E as RescueEngine>::Params as RescueHashParams<E>>::SBox1: PlonkCsSBox<E>,
-{
+    > Circuit<E> for RecursiveAggregationCircuit<'a, E, C, OldP, WP, AD, T> {
     type MainGate = Width4MainGateWithDNext;
 
     fn declare_used_gates() -> Result<Vec<Box<dyn GateInternal<E>>>, SynthesisError> {
@@ -198,26 +201,31 @@ where
         )?;
 
 
-        let mut sponge = StatefulRescueGadget::<E>::new(self.rescue_params);
+        let mut sponge = JiveChannelGadget::<E>::new(self.jive_params);
 
         for w in fs_witnesses.into_iter() {
-            sponge.absorb_single_value(cs, w, self.rescue_params)?;
+            sponge.consume(w.get_variable(), cs)?;
         }
 
-        sponge.pad_if_necessary(self.rescue_params)?;
+        let aggregation_challenge = sponge.produce_challenge(cs)?;
 
-        let aggregation_challenge = sponge
-            .squeeze_out_single(cs, self.rescue_params)?
-            .into_allocated_num(cs)?;
+        let mut current = aggregation_challenge.clone();
 
-        let mut pairs_for_generator = vec![];
-        let mut pairs_for_x = vec![];
+        let mut points_gen: Vec<WP> = vec![];
+        let mut points_x: Vec<WP> = vec![];
+        let mut scalars_gen: Vec<AllocatedNum<E>> = vec![];
+        let mut scalars_x: Vec<AllocatedNum<E>> = vec![];
 
         for proof_idx in 0..self.num_proofs_to_check {
             let proof = &proof_witnesses[proof_idx];
             let inputs = &proof_inputs[proof_idx];
 
-            let [pair_with_generator, pair_with_x] = aggregate_proof::<_, _, T, CS::Params, C, OldP, _, _>(
+            let (
+                inner_scalars_gen,
+                inner_points_gen,
+                inner_scalars_x,
+                inner_points_x,
+            ) = aggregate_proof::<_, _, T, CS::Params, C, OldP, _, _>(
                 cs,
                 self.transcript_params,
                 &inner_vk,
@@ -226,8 +234,17 @@ where
                 self.rns_params,
             )?;
 
-            pairs_for_generator.push(pair_with_generator);
-            pairs_for_x.push(pair_with_x);
+            for num in inner_scalars_gen.iter() {
+                scalars_gen.push(num.mul(cs, &current)?);
+            }
+            let neg_current = AllocatedNum::zero(cs).sub(cs, &current)?;
+            for num in inner_scalars_x.iter() {
+                scalars_x.push(num.mul(cs, &neg_current)?);
+            }
+
+            points_gen.extend(inner_points_gen);
+            points_x.extend(inner_points_x);
+            current = current.mul(cs, &aggregation_challenge)?;
 
             // If inner circuit is recursive, aggregate the aggregated points from the inner circuit
             if self.is_inner_recursive {
@@ -238,8 +255,11 @@ where
                 let (inner_pair_with_x, rest) = WrappedAffinePoint::from_allocated_limb_witness(cs, rest, &self.rns_params, &self.aux_data)?;
                 assert_eq!(rest.len(), 0);
 
-                pairs_for_generator.push(inner_pair_with_generator);
-                pairs_for_x.push(inner_pair_with_x);
+                points_gen.push(inner_pair_with_generator);
+                points_x.push(inner_pair_with_x);
+                scalars_gen.push(current);
+                scalars_x.push(current);
+                current = current.mul(cs, &aggregation_challenge)?;
             }
 
             if proof_idx > 0 {
@@ -250,37 +270,12 @@ where
             }
         }
 
-        let mut scalars = vec![];
-        scalars.push(aggregation_challenge.clone());
-
-        let mut current = aggregation_challenge.clone();
-        for _ in 1..pairs_for_generator.len() {
-            let new = current.mul(cs, &aggregation_challenge)?;
-            scalars.push(new.clone());
-
-            current = new;
-        }
-
-        let pair_with_generator = WP::multiexp(
-            cs,
-            &scalars,
-            &pairs_for_generator,
-            None,
-            self.rns_params,
-            &self.aux_data,
-        )?;
-        let pair_with_x = WP::multiexp(
-            cs,
-            &scalars,
-            &pairs_for_x,
-            None,
-            self.rns_params,
-            &self.aux_data,
-        )?;
+        let acc_pair_with_generator = WP::multiexp(cs, &scalars_gen[..], &points_gen[..], None, &self.rns_params, &self.aux_data)?;
+        let acc_pair_with_x = WP::multiexp(cs, &scalars_x[..], &points_x[..], None, &self.rns_params, &self.aux_data)?;
 
         match (
-            pair_with_generator.get_point().get_value(),
-            pair_with_x.get_point().get_value(),
+            acc_pair_with_generator.get_point().get_value(),
+            acc_pair_with_x.get_point().get_value(),
             self.g2_elements,
         ) {
             (Some(with_gen), Some(with_x), Some(g2_elements)) => {
@@ -310,18 +305,25 @@ where
 
         // verify merkle tree root
         {
-            let gadget = MerkleGadget::new(cs, false)?;
-            let leaves = proof_inputs.iter().map(|inp| inp.merkle_root.into_le_bytes(cs)).collect::<Result<Vec<_>,_>>()?;
-            let root = gadget.merkle_root(cs, leaves)?;
+            let hasher = Sha256Hasher::new(cs, false)?;
+            let merkle_gadget = MerkleGadget::new(&hasher);
+            let leaves = proof_inputs.iter().map(|inp| inp.merkle_root.clone()).collect::<Vec<_>>();
+            let root = merkle_gadget.merkle_root(cs, leaves)?;
+            outputs.extend(&root.words);
+        }
 
-            let root_inp = MerkleDigest::alloc(cs, self.merkle_root)?;
-            root.enforce_equal(cs, &root_inp)?;
-            outputs.extend(&root_inp.words);
+        // verify auxiliary root
+        {
+            let hasher = JiveGadget::new(self.jive_params);
+            let merkle_gadget = MerkleGadget::new(&hasher);
+            let leaves = proof_inputs.iter().map(|inp| inp.auxiliary_root.clone()).collect::<Vec<_>>();
+            let root = merkle_gadget.merkle_root(cs, leaves)?;
+            outputs.extend(&root.words);
         }
         
         // add parameter for is outer recursive
         if self.is_outer_recursive {
-            add_wp_points(&[pair_with_generator, pair_with_x], &mut outputs);
+            add_wp_points(&[acc_pair_with_generator, acc_pair_with_x], &mut outputs);
             for n in outputs.iter() {
                 n.get_variable().inputize(cs)?;
             }
@@ -332,8 +334,8 @@ where
                 hash_to_public_inputs.extend(allocated_num_to_aligned_big_endian(cs, &n.get_variable())?);
             }
 
-            hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_generator)?);
-            hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &pair_with_x)?);
+            hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &acc_pair_with_generator)?);
+            hash_to_public_inputs.extend(serialize_point_into_big_endian(cs, &acc_pair_with_x)?);
 
             let input_commitment = sha256_circuit_hash(cs, &hash_to_public_inputs)?;
             let keep = bytes_to_keep::<E>();
@@ -358,10 +360,10 @@ where
     }
 }
 
-pub type RecursiveAggregationCircuitBn256<'a, C, P> = RecursiveAggregationCircuit::<'a, Bn256, C, P, WrapperUnchecked<'a, Bn256>, BN256AuxData, RescueChannelGadget<Bn256>>;
+pub type RecursiveAggregationCircuitBn256<'a, C, P> = RecursiveAggregationCircuit::<'a, Bn256, C, P, WrapperUnchecked<'a, Bn256>, BN256AuxData, JiveChannelGadget<Bn256>>;
 
 // TODO: these are ugly
-fn fe_from_limbs<'a, E: RescueEngine>(limbs: &[E::Fr]) -> E::Fq {
+fn fe_from_limbs<'a, E: Engine>(limbs: &[E::Fr]) -> E::Fq {
     // TODO: fix hard-coded value
     const NBITS: u32 = 68;
 
@@ -378,21 +380,21 @@ fn fe_from_limbs<'a, E: RescueEngine>(limbs: &[E::Fr]) -> E::Fq {
     E::Fq::from_repr(repr).unwrap()
 }
 
-fn curve_from_limbs<'a, E: RescueEngine>(limbs: &[E::Fr]) -> Result<E::G1Affine, GroupDecodingError> {
+fn curve_from_limbs<'a, E: Engine>(limbs: &[E::Fr]) -> Result<E::G1Affine, GroupDecodingError> {
     assert!(limbs.len() % 2 == 0);
     let x = fe_from_limbs::<E>(&limbs[0..limbs.len()/2]);
     let y = fe_from_limbs::<E>(&limbs[limbs.len()/2..]);
     <E::G1Affine as CurveAffine>::from_xy_checked(x, y)
 }
 
-fn make_aggregate<'a, E: RescueEngine, C: Circuit<E>, P: PlonkConstraintSystemParams<E>>(
+fn make_aggregate<'a, E: JiveEngine, C: Circuit<E>, P: PlonkConstraintSystemParams<E>>(
     proofs: &[Proof<E, C>],
     inner_vk: &VerificationKey<E, C>,
     params: &'a E::Params,
     rns_params: &'a RnsParameters<E, <E::G1Affine as CurveAffine>::Base>,
     is_inner_recursive: bool,
 ) -> Result<[E::G1Affine; 2], SynthesisError> {
-    let mut channel = StatefulRescue::<E>::new(params);
+    let mut channel = StatefulJive::<E>::new(params);
     for p in proofs.iter() {
         let as_fe = <Proof<E, C> as IntoLimbedWitness<_, _, P>>::into_witness_for_params(p, rns_params)?;
 
@@ -400,8 +402,6 @@ fn make_aggregate<'a, E: RescueEngine, C: Circuit<E>, P: PlonkConstraintSystemPa
             channel.absorb_single_value(fe);
         }
     }
-
-    channel.pad_if_necessary();
 
     let aggregation_challenge: E::Fr = channel.squeeze_out_single();
 
@@ -535,14 +535,14 @@ pub fn create_recursive_circuit_proof<'a, C: Circuit<Bn256>, OldP: PlonkConstrai
     is_outer_recursive: bool,
 ) -> Result<(Proof<Bn256, RecursiveAggregationCircuitBn256<'a, C, OldP>>, Option<ProofCalldata<Bn256>>), SynthesisError> {
     let rns_params = &*RNS_PARAMETERS;
-    let inner_rescue_params = &INNER_RESCUE_PARAMETERS;
+    let inner_jive_params = &INNER_JIVE_PARAMETERS;
 
     let num_proofs_to_check = proofs.len();
 
     let aggregate = make_aggregate::<_, _, PlonkCsWidth4WithNextStepParams>(
         &proofs, 
         inner_vk,
-        &inner_rescue_params,
+        &inner_jive_params,
         &rns_params,
         is_inner_recursive
     )?;
@@ -553,14 +553,18 @@ pub fn create_recursive_circuit_proof<'a, C: Circuit<Bn256>, OldP: PlonkConstrai
     for proof in proofs.iter() {
         inputs.push(RawProofInputs::parse(&proof.inputs));
     }
-    let leaves: Vec<Vec<u8>> = inputs.iter().map(|inp| inp.merkle_root.to_bytes()).collect();
-    let merkle_root = MerkleGadget::<Bn256>::raw_merkle_root(leaves);
+    let leaves: Vec<RawSha256Digest<Bn256>> = inputs.iter().map(|inp| inp.merkle_root).collect();
+    let merkle_root = Sha256MerkleGadget::<Bn256>::raw_merkle_root(leaves, ());
+    
+    let leaves: Vec<RawJiveDigest<Bn256>> = inputs.iter().map(|inp| inp.auxiliary_root).collect();
+    let auxiliary_root = JiveMerkleGadget::<Bn256>::raw_merkle_root(leaves, &inner_jive_params);
 
     // compute cicuit inputs
     let actual_inputs: Vec<<Bn256 as ScalarEngine>::Fr> = [
         inputs[0].parent_digest.words.as_slice(),
         &inputs.last().unwrap().last_digest.words.as_slice(),
-        &merkle_root.words.as_slice()
+        &merkle_root.words.as_slice(),
+        &auxiliary_root.words.as_slice(),
     ].concat();
 
     if is_outer_recursive {
@@ -581,13 +585,12 @@ pub fn create_recursive_circuit_proof<'a, C: Circuit<Bn256>, OldP: PlonkConstrai
         num_inputs,
         inner_vk,
         proofs: Some(proofs),
-        rescue_params: &inner_rescue_params,
+        jive_params: &inner_jive_params,
         rns_params: &rns_params,
         aux_data,
-        transcript_params: &inner_rescue_params,
+        transcript_params: &inner_jive_params,
         
         inputs: Some(inputs),
-        merkle_root: Some(merkle_root),
         is_inner_recursive,
         is_outer_recursive,
 
@@ -709,7 +712,7 @@ pub fn create_recursive_circuit_setup<'a, C: Circuit<Bn256>, OldP: PlonkConstrai
     let mut assembly = SetupAssembly::<Bn256, Width4WithCustomGates, Width4MainGateWithDNext>::new();
 
     let rns_params = &*RNS_PARAMETERS;
-    let inner_rescue_params = &*INNER_RESCUE_PARAMETERS;
+    let inner_jive_params = &*INNER_JIVE_PARAMETERS;
     let aux_data = BN256AuxData::new();
 
     let recursive_circuit = RecursiveAggregationCircuitBn256::<C, OldP> {
@@ -717,13 +720,12 @@ pub fn create_recursive_circuit_setup<'a, C: Circuit<Bn256>, OldP: PlonkConstrai
         num_inputs,
         inner_vk,
         proofs: None,
-        rescue_params: &inner_rescue_params,
+        jive_params: &inner_jive_params,
         rns_params: &rns_params,
         aux_data,
-        transcript_params: &inner_rescue_params,
+        transcript_params: &inner_jive_params,
 
         inputs: None,
-        merkle_root: None,
         is_inner_recursive,
         is_outer_recursive,
 
@@ -758,9 +760,14 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     channel_params: &'a T::Params,
     vk: &VerificationKeyGadget<'a, E, WP>,
     proof: &ProofGadget<'a, E, WP>,
-    aux_data: &AD,
+    _aux_data: &AD,
     params: &'a RnsParameters<E, <E::G1Affine as GenericCurveAffine>::Base>,
-) -> Result<[WP; 2], SynthesisError>
+) -> Result<(
+    Vec<AllocatedNum<E>>,
+    Vec<WP>,
+    Vec<AllocatedNum<E>>,
+    Vec<WP>,
+), SynthesisError>
     where 
     E: Engine, CS: ConstraintSystem<E>, T: ChannelGadget<E>, AD: AuxData<E>,
     P: PlonkConstraintSystemParams<E>, C: Circuit<E>, OldP: PlonkConstraintSystemParams<E>,
@@ -989,6 +996,9 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     let alpha_pow_4 = alpha_pow_3.mul(cs, &alpha)?;
     let alpha_pow_5 = alpha_pow_4.mul(cs, &alpha)?;
     let alpha_pow_6 = alpha_pow_5.mul(cs, &alpha)?;
+    let alpha_pow_7 = alpha_pow_6.mul(cs, &alpha)?;
+    let alpha_pow_8 = alpha_pow_7.mul(cs, &alpha)?;
+    let alpha_pow_9 = alpha_pow_8.mul(cs, &alpha)?;
 
     // do the actual check for relationship at z
     {
@@ -1074,15 +1084,15 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
             let mut tmp = proof.lookup_s_poly_opening_at_z_omega.unwrap().mul(cs, &beta_for_lookup.unwrap())?;
             tmp = tmp.add(cs, &lookup_gamma_beta.unwrap())?;
             tmp = tmp.mul(cs, &proof.lookup_grand_product_opening_at_z_omega.unwrap())?;
-            tmp = tmp.mul(cs, &alpha_pow_3)?;
+            tmp = tmp.mul(cs, if has_custom_gate { &alpha_pow_7 } else { &alpha_pow_3 })?;
             tmp = tmp.mul(cs, &z_minus_omega_inv)?;
             rhs = rhs.add(cs, &tmp)?;
 
-            let tmp = l_0_at_z.mul(cs, &alpha_pow_4)?;
+            let tmp = l_0_at_z.mul(cs, if has_custom_gate { &alpha_pow_8 } else { &alpha_pow_4 })?;
             rhs = rhs.sub(cs, &tmp)?;
 
             let mut tmp = l_minus1_at_z.mul(cs, &expected)?;
-            tmp = tmp.mul(cs, &alpha_pow_5)?;
+            tmp = tmp.mul(cs, if has_custom_gate { &alpha_pow_9 } else { &alpha_pow_5 })?;
             rhs = rhs.sub(cs, &tmp)?;
         }
 
@@ -1100,10 +1110,11 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     // honomorphic commitments, and simultaneously add (through the separation scalar "u")
     // part for opening of z(X) at z*omega
 
-    let mut virtual_commitment_for_linearization_poly = {
-        let mut points: Vec<WP> = vec![];
-        let mut scalars: Vec<AllocatedNum<E>> = vec![];
-        
+    let mut points: Vec<WP> = vec![];
+    let mut scalars: Vec<AllocatedNum<E>> = vec![];
+    
+    // virtual_commitment_for_linearization_poly
+    {
         points.push(vk.gate_setup_commitments[selector_q_const_index].clone());
         if has_custom_gate {
             scalars.push(proof.gate_selector_values_at_z[0].clone());
@@ -1405,20 +1416,13 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
             scalars.push(factor);
         }
 
-        let mut r = WP::multiexp(cs, &scalars[..], &points[..], None, params, aux_data)?;
-
-        r = r.mul(cs, &v, None, params, aux_data)?;
-
-        r
-    };
+        for x in scalars.iter_mut() {
+            *x = x.mul(cs, &v)?;
+        }
+    }
 
     // now check the openings
     // aggregate t(X) from parts
-
-    let mut commitments_aggregation = proof.quotient_poly_commitments[0].clone();
-
-    let mut scalars : Vec<AllocatedNum<E>> = vec![];
-    let mut points: Vec<WP> = vec![];
 
     let mut current = z_in_pow_domain_size.clone();
     for part in proof.quotient_poly_commitments.iter().skip(1) {
@@ -1429,8 +1433,6 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     }
 
     let mut multiopening_challenge = v.clone();
-    // power of v is contained inside
-    commitments_aggregation = commitments_aggregation.add(cs, &mut virtual_commitment_for_linearization_poly, params)?;
 
     // do the same for wires
     for com in proof.wire_commitments.iter() {
@@ -1597,12 +1599,20 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     // arg1 = proof_for_z + u*proof_for_z_omega
     // arg2 = z*proof_for_z + z*omega*u*proof_for_z_omega + (aggregated_commitment - aggregated_opening)
 
-    let mut opening_at_z_proof = proof.opening_at_z_proof.clone();
-    let mut opening_at_z_omega_proof = proof.opening_at_z_omega_proof.clone();
-    let mut pair_with_x_negated = opening_at_z_omega_proof.mul(cs, &u, None, params, aux_data)?;
-    pair_with_x_negated = pair_with_x_negated.add(cs, &mut opening_at_z_proof, params)?;
-    
-    let pair_with_x = pair_with_x_negated.negate(cs, params)?;
+    let opening_at_z_proof = proof.opening_at_z_proof.clone();
+    let opening_at_z_omega_proof = proof.opening_at_z_omega_proof.clone();
+    //let mut pair_with_x_negated = opening_at_z_omega_proof.mul(cs, &u, None, params, aux_data)?;
+    //pair_with_x_negated = pair_with_x_negated.add(cs, &mut opening_at_z_proof, params)?;
+    //let pair_with_x = pair_with_x_negated.negate(cs, params)?;
+
+    let scalars_x = vec![
+        AllocatedNum::one(cs),
+        u,
+    ];
+    let points_x = vec![
+        opening_at_z_proof,
+        opening_at_z_omega_proof,
+    ];
 
     // to second multiexp
     points.push(proof.opening_at_z_proof.clone());
@@ -1633,11 +1643,22 @@ pub fn aggregate_proof<'a, E, CS, T, P, C, OldP, AD, WP>(
     points.push(proof.opening_at_z_omega_proof.clone());
     scalars.push(z_omega_by_u);
 
-    let mut tmp = WP::multiexp(cs, &scalars[..], &points[..], None, params, aux_data)?;
-    //to second multiexp
-    let pair_with_generator = commitments_aggregation.add(cs, &mut tmp, params)?;
+    points.push(proof.quotient_poly_commitments[0].clone());
+    scalars.push(AllocatedNum::one(cs));
 
-    Ok([pair_with_generator, pair_with_x])
+    //let mut tmp = WP::multiexp(cs, &scalars[..], &points[..], None, params, aux_data)?;
+    //let mut commitments_aggregation = proof.quotient_poly_commitments[0].clone();
+    //// virtual_commitment_for_linearization_poly power of v is contained inside tmp
+    ////commitments_aggregation = commitments_aggregation.add(cs, &mut virtual_commitment_for_linearization_poly, params)?;
+    //let pair_with_generator = commitments_aggregation.add(cs, &mut tmp, params)?;
+
+    //Ok([pair_with_generator, pair_with_x])
+    Ok((
+        scalars,
+        points,
+        scalars_x,
+        points_x,
+    ))
 }
 
 pub trait IntoLimbedWitness<E: Engine, C: Circuit<E>, P: PlonkConstraintSystemParams<E>> {

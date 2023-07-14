@@ -1404,25 +1404,15 @@ impl<E: Engine, P: PlonkConstraintSystemParams<E>, MG: MainGate<E>, S: Synthesis
         min_space_for_lookups += self.n();
 
         let total_number_of_table_entries = self.num_table_lookups + self.total_length_of_all_tables;
-
-        let new_size_candidates = [(self.n() + 1).next_power_of_two() - 1, (min_space_for_lookups + 1).next_power_of_two() - 1];
-        // let new_size_candidates = [(self.n() + 1).next_power_of_two() - 1, (total_number_of_table_entries + 1).next_power_of_two() - 1];
-
-        let mut new_size = *new_size_candidates.iter().max().unwrap();
-        if new_size < total_number_of_table_entries * 2 {
-            new_size = new_size.next_power_of_two() * 2 - 1;
-        }
-        assert!(new_size >= total_number_of_table_entries * 2, "circuit size to fit is {}, but lookup entries need {} elements alone", new_size, total_number_of_table_entries);
+        let new_size_candidates = [(self.n() + 1).next_power_of_two() - 1, (total_number_of_table_entries + 1).next_power_of_two() - 1];
+        let new_size = *new_size_candidates.iter().max().unwrap();
         assert!(new_size <= 1usize << E::Fr::S);
         assert!(new_size <= (1usize << E::Fr::S) / <Self as ConstraintSystem<E>>::Params::STATE_WIDTH);
 
         let dummy = Self::get_dummy_variable();
 
-        // let empty_gate = MainGateTerm::<E>::new();
         let empty_vars = vec![dummy; <Self as ConstraintSystem<E>>::Params::STATE_WIDTH];
         let empty_witness = vec![E::Fr::zero(); <Self as ConstraintSystem<E>>::Params::WITNESS_WIDTH];
-
-        // let mg = MG::default();
 
         for _ in self.n()..new_size {
 
@@ -1434,13 +1424,6 @@ impl<E: Engine, P: PlonkConstraintSystemParams<E>, MG: MainGate<E>, S: Synthesis
             ).unwrap();
 
             self.end_gates_batch_for_step().unwrap();
-
-            // self.new_single_gate_for_trace_step(
-            //     &mg, 
-            //     &coeffs, 
-            //     &vars,
-            //     &[]
-            // ).expect("must add padding gate");
         }
 
         let new_size_for_aux = new_size - self.num_input_gates;

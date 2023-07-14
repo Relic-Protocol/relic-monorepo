@@ -72,7 +72,6 @@ pub fn constraint_num_bits<E: Engine, CS: ConstraintSystem<E>>(cs: &mut CS, el: 
                     self::single_table_range_constraint::enforce_using_single_column_table(cs, &el, num_bits)?;
                 },
                 RangeConstraintStrategy::CustomTwoBitGate => {
-                    unreachable!();
                     let _ = create_range_constraint_chain(cs, &el, num_bits)?;
                 }
                 _ => {unimplemented!("range constraint strategies other than multitable, single table or custom gate are not yet handled")}

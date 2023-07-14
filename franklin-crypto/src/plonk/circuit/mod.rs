@@ -1,4 +1,5 @@
 pub mod allocated_num;
+pub mod affine_point_wrapper;
 pub mod custom_rescue_gate;
 pub mod rescue;
 pub mod linear_combination;
@@ -13,7 +14,6 @@ pub mod bigint_new;
 pub mod simple_term;
 pub mod curve;
 pub mod curve_new;
-pub mod verifier_circuit;
 pub mod tables;
 pub mod counter;
 pub mod byte;
@@ -21,6 +21,8 @@ pub mod utils;
 pub mod permutation_network;
 pub mod edwards;
 pub mod custom_5th_degree_gate_optimized;
+pub mod jive;
+pub mod channel;
 
 pub mod assignment;
 pub mod hashes_with_tables;

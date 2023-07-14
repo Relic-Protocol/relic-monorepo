@@ -154,28 +154,28 @@ impl<'a, E: Engine> AssembledPolynomialStorage<'a, E> {
     pub fn get_poly(&self, id: PolyIdentifier) -> &Polynomial<E::Fr, Values> {
         match id {
             p @ PolyIdentifier::VariablesPolynomial(..) => {
-                self.state_map.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.state_map.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::WitnessPolynomial(..) => {
-                self.witness_map.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.witness_map.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::GateSetupPolynomial(..) => {
-                self.setup_map.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.setup_map.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::GateSelector(..) => {
-                self.gate_selectors.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.gate_selectors.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::PermutationPolynomial(..) => {
-                self.setup_map.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.setup_map.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::LookupSelector => {
-                self.named_polys.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.named_polys.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::LookupTableEntriesPolynomial(..) => {
-                self.named_polys.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.named_polys.get(&p).expect("poly must exist").as_ref()
             },
             p @ PolyIdentifier::NamedSetupPolynomial(..) => {
-                self.named_polys.get(&p).expect(&format!("poly {:?} must exist", p)).as_ref()
+                self.named_polys.get(&p).expect("poly must exist").as_ref()
             },
             _ => {
                 unreachable!()

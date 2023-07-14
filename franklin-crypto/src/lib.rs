@@ -26,7 +26,8 @@ extern crate arr_macro;
 
 
 #[cfg(test)]
-extern crate hex;
+#[macro_use]
+extern crate hex_literal;
 
 pub mod jubjub;
 pub mod alt_babyjubjub;
@@ -39,6 +40,7 @@ pub mod util;
 pub mod interpolation;
 pub mod as_waksman;
 pub mod rescue;
+pub mod jive;
 pub mod generic_twisted_edwards;
 pub mod plonk;
 

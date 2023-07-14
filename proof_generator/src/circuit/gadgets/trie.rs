@@ -199,7 +199,7 @@ impl<E: Engine, const PL: usize, const NL: usize> MPTGadget<E, PL, NL> {
 
         // initialize result variables
         let mut exists = Boolean::Constant(false);
-        let mut value = VarVec::constant(&vec![]);
+        let mut value = VarVec::constant(vec![]);
 
         let mut expected = expected_root;
         let mut done = Boolean::Constant(false);
@@ -239,9 +239,9 @@ impl<E: Engine, const PL: usize, const NL: usize> MPTGadget<E, PL, NL> {
                 let first_nibble_ok = Boolean::or(cs, &first_nibble_equals, &is_odd_length.not())?;
 
                 // skip a key nibble if needed
-                key_nibbles = key_nibbles.suffix(cs, Num::from_boolean_is(is_odd_length), Some(1))?;
+                key_nibbles = key_nibbles.suffix(cs, Num::from_boolean_is(is_odd_length))?;
 
-                path = path.suffix(cs, one, None)?;
+                path = path.suffix(cs, one)?;
 
                 // check if remaining path matches key
                 let mut path_nibbles = KeyNibbleVec::from(&bytes_to_nibbles(cs, &path.vals[..KEY_NIBBLE_LEN/2])?);
@@ -253,7 +253,7 @@ impl<E: Engine, const PL: usize, const NL: usize> MPTGadget<E, PL, NL> {
                 // skip past the key nibbles
                 let mut skip_offset = Num::from_boolean_is(is_leaf_or_extension);
                 skip_offset = skip_offset.mul(cs, &path_nibbles.length)?;
-                key_nibbles = key_nibbles.suffix(cs, skip_offset, None)?;
+                key_nibbles = key_nibbles.suffix(cs, skip_offset)?;
 
                 // handle extension node
                 {
